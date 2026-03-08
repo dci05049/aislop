@@ -37,23 +37,48 @@ async function downloadSession(sessionId: string): Promise<SessionData> {
   return res.json() as Promise<SessionData>;
 }
 
+function deriveProjectKey(projectPath: string): string {
+  return projectPath.replace(/\//g, '-');
+}
+
+function remapPaths(content: string, oldProjectPath: string, newProjectPath: string): string {
+  if (oldProjectPath === newProjectPath) return content;
+  // Replace all occurrences of the old project path with the new one
+  return content.split(oldProjectPath).join(newProjectPath);
+}
+
 async function restoreSession(data: SessionData): Promise<void> {
   const { metadata, transcript } = data;
   const claudeDir = path.join(os.homedir(), '.claude');
-  const projectDir = path.join(claudeDir, 'projects', metadata.projectKey);
+
+  // Use the local CWD to derive the project key so Claude Code can find the session
+  const localProjectPath = process.cwd();
+  const localProjectKey = deriveProjectKey(localProjectPath);
+  const remoteProjectPath = metadata.projectPath;
+
+  const projectDir = path.join(claudeDir, 'projects', localProjectKey);
   const transcriptPath = path.join(projectDir, `${metadata.sessionId}.jsonl`);
   const historyPath = path.join(claudeDir, 'history.jsonl');
 
-  // Create project directory
-  await fs.mkdir(projectDir, { recursive: true });
+  // Create project directory and session-env directory
+  const sessionEnvDir = path.join(claudeDir, 'session-env', metadata.sessionId);
+  await Promise.all([
+    fs.mkdir(projectDir, { recursive: true }),
+    fs.mkdir(sessionEnvDir, { recursive: true }),
+  ]);
 
-  // Write transcript
-  await fs.writeFile(transcriptPath, transcript, 'utf-8');
+  // Remap paths in transcript from the remote user's paths to local paths
+  const remappedTranscript = remapPaths(transcript, remoteProjectPath, localProjectPath);
+  await fs.writeFile(transcriptPath, remappedTranscript, { encoding: 'utf-8', mode: 0o600 });
   console.log(`Transcript written → ${transcriptPath}`);
 
-  // Append history entries
+  if (remoteProjectPath !== localProjectPath) {
+    console.log(`  (remapped paths: ${remoteProjectPath} → ${localProjectPath})`);
+  }
+
+  // Remap paths in history entries and append
   const historyLines = metadata.historyEntries
-    .map((entry) => JSON.stringify(entry))
+    .map((entry) => remapPaths(JSON.stringify(entry), remoteProjectPath, localProjectPath))
     .join('\n');
   await fs.appendFile(historyPath, historyLines + '\n', 'utf-8');
   console.log(`History entries appended → ${historyPath}`);
@@ -74,6 +99,7 @@ async function main(): Promise<void> {
   // List available sessions, filter out already-pulled ones
   const allSessions = await listSessions();
   const claudeDir = path.join(os.homedir(), '.claude');
+  const localProjectKey = deriveProjectKey(process.cwd());
 
   const sessions: SessionSummary[] = [];
   for (const s of allSessions) {
@@ -81,7 +107,8 @@ async function main(): Promise<void> {
       sessions.push(s);
       continue;
     }
-    const localPath = path.join(claudeDir, 'projects', s.projectKey, `${s.sessionId}.jsonl`);
+    // Check under the local project key (where we'd restore to), not the remote one
+    const localPath = path.join(claudeDir, 'projects', localProjectKey, `${s.sessionId}.jsonl`);
     try {
       await fs.access(localPath);
       // File exists — already pulled, skip
